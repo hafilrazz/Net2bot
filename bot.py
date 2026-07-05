@@ -5,7 +5,6 @@ import re
 from typing import Dict, Optional, Tuple
 import time
 from threading import Thread
-import signal
 import sys
 
 import requests
@@ -31,8 +30,6 @@ logger = logging.getLogger(__name__)
 
 app_flask = Flask(__name__)
 application = None
-loop = None
-bot_thread = None
 
 START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
@@ -460,8 +457,8 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def run_bot_in_thread():
-    """Run bot in a separate thread with its own event loop"""
-    global application, loop
+    """Run bot in a separate thread"""
+    global application
     
     logger.info("=" * 60)
     logger.info("🤖 NETFLIX COOKIE CHECKER BOT")
@@ -472,12 +469,18 @@ def run_bot_in_thread():
         return
     
     try:
-        # Create new event loop for this thread
+        # Create a new event loop for this thread
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         
+        logger.info("✅ Event loop created")
+        logger.info("🏗️ Building application...")
+        
         # Build application
         application = ApplicationBuilder().token(BOT_TOKEN).build()
+        
+        logger.info("✅ Application built successfully")
+        logger.info("📌 Adding handlers...")
         
         application.add_handler(CommandHandler("start", start))
         application.add_handler(CommandHandler("help", help_command))
@@ -491,10 +494,9 @@ def run_bot_in_thread():
         
     except Exception as e:
         logger.error(f"❌ Bot error: {e}", exc_info=True)
+        application = None
     finally:
         logger.info("🛑 Bot stopped")
-        if loop:
-            loop.close()
 
 
 # Flask Routes
@@ -555,8 +557,8 @@ if __name__ == "__main__":
     bot_thread = Thread(target=run_bot_in_thread, daemon=False)
     bot_thread.start()
     
-    # Wait a bit for bot to initialize
-    time.sleep(3)
+    # Wait for bot to initialize
+    time.sleep(5)
     
     # Run Flask
     logger.info(f"🚀 Starting Flask server on port {PORT}\n")
