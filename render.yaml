@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: netflix-cookie-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
+    envVars:
+      - key: BOT_TOKEN
+        scope: run
+        value: 8768900516:AAFILD7f2aS4JVM7OapMDdL8BPH_0Tb1GVY
+      - key: WEBHOOK_URL
+        scope: run
+        value: https://your-app.onrender.com
+      - key: PORT
+        scope: run
+        value: "8000"
