@@ -36,12 +36,7 @@ START_TEXT = (
     "Paste your Netflix cookies here (the bot will NOT store or log them).\n\n"
     "Accepted formats:\n"
     "• Full `Cookie:` header line\n"
-    "• Key=Value pairs: `NetflixId=...; SecureNetflixId=...; ...`\n"
-    "• Netscape format (from browser export):\n"
-    "```\n"
-    ".netflix.com\tTRUE\t/\tTRUE\t1234567890\tNetflixId\tvalue\n"
-    ".netflix.com\tTRUE\t/\tTRUE\t1234567890\tSecureNetflixId\tvalue\n"
-    "```\n\n"
+    "• Or values like: NetflixId=...; SecureNetflixId=...; OptanonConsent=...\n\n"
     "Send cookies now:"
 )
 
@@ -49,73 +44,19 @@ HELP_TEXT = (
     "How it works:\n"
     "• Use /start then paste cookies.\n"
     "• Bot validates cookies using Netflix api.\n"
-    "• If valid, bot converts it into a session login link ( phone | pc | tv )\n\n"
-    "Supported formats:\n"
-    "1. Cookie header: `Cookie: name=value; name2=value2`\n"
-    "2. Key-Value pairs: `NetflixId=xxx; SecureNetflixId=xxx`\n"
-    "3. Netscape format (from browser exports)"
+    "• If valid, bot converts it into a session login link ( phone | pc | tv )"
 )
 
 COOKIE_NAME_RE = re.compile(r"(?i)\b(netflixid|securenetflixid|netflixcookies|__secure-netflixcookies)\b")
 COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
-NETSCAPE_RE = re.compile(r"^([^\t]+)\t(TRUE|FALSE)\t([^\t]+)\t(TRUE|FALSE)\t(\d+)\t([^\t]+)\t(.+)$", re.MULTILINE)
 
 
 def _looks_like_cookie_header(text: str) -> bool:
     t = text.strip().lower()
-    return t.startswith("cookie:") or ("=" in text and ";" in text)
-
-
-def _looks_like_netscape_format(text: str) -> bool:
-    """Check if text looks like Netscape cookie format"""
-    lines = text.strip().split('\n')
-    # Netscape format has tab-separated values
-    netscape_count = 0
-    for line in lines[:5]:  # Check first 5 lines
-        if line.startswith('#'):  # Comments in Netscape format
-            netscape_count += 1
-        elif '\t' in line and len(line.split('\t')) >= 7:
-            netscape_count += 1
-    return netscape_count >= 2
-
-
-def _parse_netscape_cookies(text: str) -> Dict[str, str]:
-    """
-    Parse Netscape cookie format
-    Format: domain flag path secure expiration name value
-    Example:
-    .netflix.com	TRUE	/	TRUE	1234567890	NetflixId	abc123xyz
-    .netflix.com	TRUE	/	TRUE	1234567890	SecureNetflixId	def456uvw
-    """
-    cookies = {}
-    lines = text.strip().split('\n')
-    
-    for line in lines:
-        # Skip comments and empty lines
-        if not line.strip() or line.startswith('#'):
-            continue
-        
-        try:
-            parts = line.split('\t')
-            if len(parts) >= 7:
-                # domain, flag, path, secure, expiration, name, value
-                name = parts[5].strip()
-                value = parts[6].strip()
-                
-                if name and value:
-                    cookies[name] = value
-                    logger.info(f"✅ Parsed Netscape cookie: {name}")
-        except Exception as e:
-            logger.warning(f"⚠️ Could not parse Netscape line: {line[:50]}... Error: {e}")
-            continue
-    
-    return cookies
+    return t.startswith("cookie:") or ";" in text
 
 
 def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
-    """
-    Accept key=value; key2=value2 format
-    """
     cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", text).strip()
     parts = [p.strip() for p in cleaned.split(";") if p.strip()]
     if len(parts) == 1 and "\n" in cleaned:
@@ -133,42 +74,16 @@ def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
 
 
 def _build_cookie_header(cookie_input: str) -> Optional[str]:
-    """
-    Parse cookies from multiple formats and return as Cookie header string
-    Supports:
-    1. Cookie header format: "Cookie: name=value; name2=value2"
-    2. Key-value pairs: "name=value; name2=value2"
-    3. Netscape format (tab-separated)
-    """
-    if not cookie_input or not cookie_input.strip():
-        return None
-    
-    kv: Dict[str, str] = {}
-    
-    # Try Netscape format first (has tabs)
-    if _looks_like_netscape_format(cookie_input):
-        logger.info("📋 Detected Netscape cookie format")
-        kv = _parse_netscape_cookies(cookie_input)
-    
-    # If no cookies found, try standard formats
-    if not kv:
-        # Remove leading "Cookie:" if present
+    if _looks_like_cookie_header(cookie_input):
         cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", cookie_input).strip()
-        
-        # Basic sanity: require at least one '='
         if "=" not in cleaned:
             return None
-        
-        # Try parsing as key=value pairs
-        kv = _extract_cookie_kv_pairs(cleaned)
-    
+        return cleaned
+
+    kv = _extract_cookie_kv_pairs(cookie_input)
     if not kv:
         return None
-    
-    # Rebuild into Cookie header format
-    cookie_header = "; ".join([f"{k}={v}" for k, v in kv.items()])
-    logger.info(f"✅ Built cookie header with {len(kv)} cookies")
-    return cookie_header
+    return "; ".join([f"{k}={v}" for k, v in kv.items()])
 
 
 def _safe_preview_cookie_keys(cookie_header: str) -> str:
@@ -469,10 +384,9 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             await update.message.reply_text(
                 "❌ Could not parse cookies.\n\n"
                 "Paste either:\n"
-                "• Full `Cookie:` header line\n"
-                "• Key=Value pairs: `NetflixId=...; SecureNetflixId=...`\n"
-                "• Netscape format (tab-separated)\n\n"
-                "Then send again."
+                "• Full `Cookie:` header line, or\n"
+                "• Key=Value pairs (NetflixId=..., SecureNetflixId=..., ...)"
+                "\n\nThen send again."
             )
             return
 
@@ -515,7 +429,6 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                     f"• Max streams: {html.escape(str(acct.get('max_streams','Unknown')))}\n"
                     f"• Phone: {html.escape(str(acct.get('phone','Unknown')))} (verified: {html.escape(str(acct.get('phone_verified','Unknown')))})\n"
                     f"• Plan quality: {html.escape(str(acct.get('video_quality','Unknown')))}\n"
-                    "<b> Bot by @ritsurex 🦖<b>"
                 )
 
             status_html = html.escape(status_line)
@@ -619,12 +532,6 @@ def index():
                     <p><b>Port:</b> {PORT}</p>
                 </div>
                 <hr>
-                <h3>📋 Supported Cookie Formats:</h3>
-                <ul>
-                    <li><b>Standard Header:</b> Cookie: NetflixId=xxx; SecureNetflixId=yyy</li>
-                    <li><b>Key-Value Pairs:</b> NetflixId=xxx; SecureNetflixId=yyy</li>
-                    <li><b>Netscape Format:</b> Tab-separated with domain, path, expiry, name, value</li>
-                </ul>
                 <p><a href="/health">Check Health</a></p>
             </div>
         </body>
