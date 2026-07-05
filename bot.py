@@ -4,6 +4,7 @@ import logging
 import re
 from typing import Dict, Optional, Tuple
 import time
+from threading import Thread
 import signal
 import sys
 
@@ -30,7 +31,8 @@ logger = logging.getLogger(__name__)
 
 app_flask = Flask(__name__)
 application = None
-bot_task = None
+loop = None
+bot_thread = None
 
 START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
@@ -457,9 +459,9 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             pass
 
 
-async def run_bot():
-    """Run bot polling"""
-    global application
+def run_bot_in_thread():
+    """Run bot in a separate thread with its own event loop"""
+    global application, loop
     
     logger.info("=" * 60)
     logger.info("🤖 NETFLIX COOKIE CHECKER BOT")
@@ -470,6 +472,11 @@ async def run_bot():
         return
     
     try:
+        # Create new event loop for this thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Build application
         application = ApplicationBuilder().token(BOT_TOKEN).build()
         
         application.add_handler(CommandHandler("start", start))
@@ -479,12 +486,15 @@ async def run_bot():
         logger.info("✅ Handlers registered")
         logger.info("🚀 Starting polling...\n")
         
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        # Run polling
+        loop.run_until_complete(application.run_polling(allowed_updates=Update.ALL_TYPES))
         
     except Exception as e:
         logger.error(f"❌ Bot error: {e}", exc_info=True)
     finally:
         logger.info("🛑 Bot stopped")
+        if loop:
+            loop.close()
 
 
 # Flask Routes
@@ -496,21 +506,27 @@ def index():
         <head>
             <title>Netflix Cookie Checker Bot</title>
             <style>
-                body {{ font-family: Arial; margin: 40px; }}
-                .status {{ padding: 20px; border-radius: 5px; }}
-                .running {{ background-color: #d4edda; }}
-                .stopped {{ background-color: #f8d7da; }}
+                body {{ font-family: Arial; margin: 40px; background-color: #f5f5f5; }}
+                .container {{ background: white; padding: 30px; border-radius: 10px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }}
+                .status {{ padding: 20px; border-radius: 5px; margin: 20px 0; }}
+                .running {{ background-color: #d4edda; color: #155724; }}
+                .stopped {{ background-color: #f8d7da; color: #721c24; }}
+                h1 {{ color: #333; }}
+                a {{ color: #007bff; text-decoration: none; }}
+                a:hover {{ text-decoration: underline; }}
             </style>
         </head>
         <body>
-            <h1>✅ Netflix Cookie Checker Bot</h1>
-            <div class="status {'running' if application else 'stopped'}">
-                <p><b>Bot Status:</b> {bot_status}</p>
-                <p><b>BOT_TOKEN:</b> {'✅ Set' if BOT_TOKEN else '❌ Not Set'}</p>
-                <p><b>Port:</b> {PORT}</p>
+            <div class="container">
+                <h1>✅ Netflix Cookie Checker Bot</h1>
+                <div class="status {'running' if application else 'stopped'}">
+                    <p><b>Bot Status:</b> {bot_status}</p>
+                    <p><b>BOT_TOKEN:</b> {'✅ Set' if BOT_TOKEN else '❌ Not Set'}</p>
+                    <p><b>Port:</b> {PORT}</p>
+                </div>
+                <hr>
+                <p><a href="/health">Check Health</a></p>
             </div>
-            <hr>
-            <a href="/health">Health Check</a>
         </body>
     </html>
     """, 200
@@ -521,6 +537,7 @@ def health():
     status = "healthy" if application else "unhealthy"
     return {
         "status": status,
+        "bot_running": application is not None,
         "bot_token_set": bool(BOT_TOKEN),
         "timestamp": time.time()
     }, 200 if application else 503
@@ -534,30 +551,18 @@ if __name__ == "__main__":
         logger.error("❌ BOT_TOKEN environment variable is not set!")
         sys.exit(1)
     
-    # Create event loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+    # Start bot in background thread
+    bot_thread = Thread(target=run_bot_in_thread, daemon=False)
+    bot_thread.start()
     
-    # Schedule bot to run
-    bot_task = loop.create_task(run_bot())
+    # Wait a bit for bot to initialize
+    time.sleep(3)
     
-    def signal_handler(sig, frame):
-        logger.info("\n🛑 Shutting down...")
-        bot_task.cancel()
-        sys.exit(0)
-    
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    
-    # Run Flask with asyncio
-    logger.info(f"🚀 Starting Flask + Bot on port {PORT}\n")
+    # Run Flask
+    logger.info(f"🚀 Starting Flask server on port {PORT}\n")
     
     try:
-        # Run Flask in a way that allows asyncio to run alongside
         app_flask.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
     except KeyboardInterrupt:
         logger.info("🛑 Keyboard interrupt")
-    finally:
-        if bot_task and not bot_task.done():
-            bot_task.cancel()
-        loop.close()
+        sys.exit(0)
