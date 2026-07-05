@@ -442,6 +442,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 f"\n{status_html}"
                 f"{acct_html}",
                 parse_mode="HTML",
+                f" Bot By @ritsurex 🦖",
                 disable_web_page_preview=True,
             )
             logger.info(f"✅ Cookie validation successful for {user_id}")
