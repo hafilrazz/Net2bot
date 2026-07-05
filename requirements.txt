@@ -1,4 +1,4 @@
-python-telegram-bot==20.6
+python-telegram-bot==21.1
 requests==2.31.0
 flask==3.0.0
 urllib3==2.0.0
