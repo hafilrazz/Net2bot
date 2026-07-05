@@ -457,7 +457,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 
 def run_bot_in_thread():
-    """Run bot in a separate thread"""
+    """Run bot in a separate thread with signal handling disabled"""
     global application
     
     logger.info("=" * 60)
@@ -489,8 +489,13 @@ def run_bot_in_thread():
         logger.info("✅ Handlers registered")
         logger.info("🚀 Starting polling...\n")
         
-        # Run polling
-        loop.run_until_complete(application.run_polling(allowed_updates=Update.ALL_TYPES))
+        # Run polling WITHOUT signal handlers (they don't work in threads)
+        loop.run_until_complete(
+            application.run_polling(
+                allowed_updates=Update.ALL_TYPES,
+                stop_signals=()  # Disable signal handling in thread
+            )
+        )
         
     except Exception as e:
         logger.error(f"❌ Bot error: {e}", exc_info=True)
