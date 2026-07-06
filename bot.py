@@ -34,10 +34,10 @@ application = None
 
 START_TEXT = (
     "👋 Netflix Cookie Checker Bot\n\n"
-    "Paste your Netflix cookies here (the bot will NOT store or log them).\n\n"
+    "Paste your Netflix cookies here.\n\n"
     "Accepted formats:\n"
     "• Full `Cookie:` header line\n"
-    "• Netscape format (.txt cookie file) - tab or space delimited\n"
+    "• Netscape format - tab or space delimited\n"
     "• JSON array format\n"
     "• Key=Value pairs: NetflixId=...; SecureNetflixId=...; nfvdid=...\n\n"
     "Send cookies now:\n\n"
