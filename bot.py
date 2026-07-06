@@ -6,6 +6,7 @@ from typing import Dict, Optional, Tuple
 import time
 from threading import Thread
 import sys
+import json
 
 import requests
 import html
@@ -36,7 +37,9 @@ START_TEXT = (
     "Paste your Netflix cookies here (the bot will NOT store or log them).\n\n"
     "Accepted formats:\n"
     "• Full `Cookie:` header line\n"
-    "• Or values like: NetflixId=...; SecureNetflixId=...; OptanonConsent=...\n\n"
+    "• Netscape format (.txt)\n"
+    "• JSON cookie array\n"
+    "• Key=Value pairs: NetflixId=...; SecureNetflixId=...; nfvdid=...\n\n"
     "Send cookies now:"
     "Bot by @ritsurex 🦖"
 )
@@ -45,16 +48,96 @@ HELP_TEXT = (
     "How it works:\n"
     "• Use /start then paste cookies.\n"
     "• Bot validates cookies using Netflix api.\n"
-    "• If valid, bot converts it into a session login link ( phone | pc | tv )"
+    "• If valid, bot converts it into a session login link (phone | pc | tv)"
 )
 
-COOKIE_NAME_RE = re.compile(r"(?i)\b(netflixid|securenetflixid|netflixcookies|__secure-netflixcookies)\b")
+# All recognized Netflix cookie names
+NETFLIX_COOKIE_NAMES = {
+    'netflixid', 'securenetflixid', 'netflixcookies', '__secure-netflixcookies',
+    'nfvdid', 'flwssn', 'OptanonConsent', 'dsca', 'memclid', 'profilesNewSession',
+    'cL', 'netflix-sans-normal-3-loaded', 'netflix-sans-bold-3-loaded',
+    'pas', 'OptanonAlertBoxClosed', 'hasSeenCookieDisclosure'
+}
+
+COOKIE_NAME_RE = re.compile(
+    r"(?i)\b(netflixid|securenetflixid|netflixcookies|__secure-netflixcookies|"
+    r"nfvdid|flwssn|OptanonConsent|dsca|memclid|profilesNewSession|cL|"
+    r"netflix-sans-normal-3-loaded|netflix-sans-bold-3-loaded|pas|"
+    r"OptanonAlertBoxClosed|hasSeenCookieDisclosure)\b"
+)
 COOKIE_KV_RE = re.compile(r"^\s*([A-Za-z0-9_\\-]+)\s*=\s*(.+?)\s*$", re.DOTALL)
+
+
+def _is_json_cookie(text: str) -> bool:
+    """Check if text is JSON cookie array."""
+    text = text.strip()
+    if not (text.startswith('[') and text.endswith(']')):
+        return False
+    try:
+        json.loads(text)
+        return True
+    except:
+        return False
+
+
+def _is_netscape_cookie(text: str) -> bool:
+    """Check if text is Netscape format cookie."""
+    lines = text.strip().split('\n')
+    if len(lines) < 1:
+        return False
+    # Netscape format: domain flag path secure expiration name value
+    for line in lines:
+        if line.startswith('#'):
+            continue
+        parts = line.split('\t')
+        if len(parts) >= 7:
+            return True
+    return False
 
 
 def _looks_like_cookie_header(text: str) -> bool:
     t = text.strip().lower()
-    return t.startswith("cookie:") or ";" in text
+    return t.startswith("cookie:") or (";" in text and "=" in text)
+
+
+def _extract_json_cookies(json_str: str) -> Dict[str, str]:
+    """Extract cookies from JSON array format."""
+    try:
+        cookies_array = json.loads(json_str)
+        kv: Dict[str, str] = {}
+        
+        if isinstance(cookies_array, list):
+            for cookie_obj in cookies_array:
+                if isinstance(cookie_obj, dict):
+                    name = cookie_obj.get('name', '')
+                    value = cookie_obj.get('value', '')
+                    if name and value:
+                        kv[name] = value
+        return kv
+    except Exception as e:
+        logger.error(f"Error parsing JSON cookies: {e}")
+        return {}
+
+
+def _extract_netscape_cookies(netscape_str: str) -> Dict[str, str]:
+    """Extract cookies from Netscape format."""
+    kv: Dict[str, str] = {}
+    lines = netscape_str.strip().split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('#'):
+            continue
+        
+        parts = line.split('\t')
+        if len(parts) >= 7:
+            # Format: domain flag path secure expiration name value
+            name = parts[5]
+            value = parts[6]
+            if name and value:
+                kv[name] = value
+    
+    return kv
 
 
 def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
@@ -75,16 +158,39 @@ def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
 
 
 def _build_cookie_header(cookie_input: str) -> Optional[str]:
+    """Parse any cookie format and build a cookie header string."""
+    
+    # Try JSON format first
+    if _is_json_cookie(cookie_input):
+        kv = _extract_json_cookies(cookie_input)
+        if kv:
+            return "; ".join([f"{k}={v}" for k, v in kv.items()])
+    
+    # Try Netscape format
+    if _is_netscape_cookie(cookie_input):
+        kv = _extract_netscape_cookies(cookie_input)
+        if kv:
+            return "; ".join([f"{k}={v}" for k, v in kv.items()])
+    
+    # Try cookie header or key=value format
     if _looks_like_cookie_header(cookie_input):
         cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", cookie_input).strip()
         if "=" not in cleaned:
             return None
+        
+        kv = _extract_cookie_kv_pairs(cookie_input)
+        if kv:
+            return "; ".join([f"{k}={v}" for k, v in kv.items()])
+        
+        # Return as-is if already in key=value format
         return cleaned
 
+    # Last resort: try to parse as key=value pairs
     kv = _extract_cookie_kv_pairs(cookie_input)
-    if not kv:
-        return None
-    return "; ".join([f"{k}={v}" for k, v in kv.items()])
+    if kv:
+        return "; ".join([f"{k}={v}" for k, v in kv.items()])
+    
+    return None
 
 
 def _safe_preview_cookie_keys(cookie_header: str) -> str:
@@ -164,7 +270,7 @@ def _extract_netflix_id_from_cookie_header(cookie_header: str) -> Optional[str]:
 def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, str, Optional[str]]:
     netflix_id = _extract_netflix_id_from_cookie_header(cookie_header)
     if not netflix_id:
-        return False, "Invalid or expired cookie.", None
+        return False, "Invalid or expired cookie. NetflixId not found.", None
 
     headers = dict(NFTOKEN_HEADERS)
     headers["Cookie"] = f"NetflixId={netflix_id}"
@@ -184,7 +290,7 @@ def _generate_nftoken(cookie_header: str, timeout_s: int = 20) -> Tuple[bool, st
         nftoken = td.get("token")
 
         if not nftoken:
-            return False, "Invalid or expired cookie.", None
+            return False, "Invalid or expired cookie. Token generation failed.", None
 
         return True, "Token API returned a valid nftoken.", nftoken
     except Exception as e:
@@ -208,7 +314,7 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
         cookie_dict[k.strip()] = v.strip()
 
     if not cookie_dict.get("NetflixId"):
-        return {"ok": False, "reason": "No NetflixId"}
+        return {"ok": False, "reason": "No NetflixId found in cookies"}
 
     session = requests.Session()
     session.cookies.update(cookie_dict)
@@ -384,8 +490,10 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if not cookie_header:
             await update.message.reply_text(
                 "❌ Could not parse cookies.\n\n"
-                "Paste either:\n"
-                "• Full `Cookie:` header line, or\n"
+                "Paste in one of these formats:\n"
+                "• Full `Cookie:` header line\n"
+                "• Netscape format (.txt cookie file)\n"
+                "• JSON array format\n"
                 "• Key=Value pairs (NetflixId=..., SecureNetflixId=..., ...)"
                 "\n\nThen send again."
             )
@@ -447,7 +555,7 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
             logger.info(f"✅ Cookie validation successful for {user_id}")
         else:
-            await msg.edit_text("❌ Invalid or expired cookie.")
+            await msg.edit_text(f"❌ {detail}")
             logger.warning(f"❌ Cookie validation failed for {user_id}: {detail}")
     except Exception as e:
         logger.error(f"Error in handle_cookie_text: {e}", exc_info=True)
@@ -573,4 +681,4 @@ if __name__ == "__main__":
         app_flask.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
     except KeyboardInterrupt:
         logger.info("🛑 Keyboard interrupt")
-        sys.exit(0)
+        sys.exit(0)     
