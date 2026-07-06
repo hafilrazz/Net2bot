@@ -37,11 +37,11 @@ START_TEXT = (
     "Paste your Netflix cookies here (the bot will NOT store or log them).\n\n"
     "Accepted formats:\n"
     "• Full `Cookie:` header line\n"
-    "• Netscape format (.txt)\n"
-    "• JSON cookie array\n"
+    "• Netscape format (.txt cookie file) - tab or space delimited\n"
+    "• JSON array format\n"
     "• Key=Value pairs: NetflixId=...; SecureNetflixId=...; nfvdid=...\n\n"
-    "Send cookies now:"
-    "Bot by @ritsurex 🦖"
+    "Send cookies now:\n\n"
+    " Bot by @ritsurex 🦖"
 )
 
 HELP_TEXT = (
@@ -81,17 +81,42 @@ def _is_json_cookie(text: str) -> bool:
 
 
 def _is_netscape_cookie(text: str) -> bool:
-    """Check if text is Netscape format cookie."""
+    """Check if text is Netscape format cookie (tab or space delimited)."""
     lines = text.strip().split('\n')
     if len(lines) < 1:
         return False
-    # Netscape format: domain flag path secure expiration name value
+    
     for line in lines:
-        if line.startswith('#'):
+        line = line.strip()
+        if not line or line.startswith('#'):
             continue
-        parts = line.split('\t')
-        if len(parts) >= 7:
-            return True
+        
+        # Try tab-delimited first
+        if '\t' in line:
+            parts = line.split('\t')
+            if len(parts) >= 7:
+                logger.debug(f"Detected tab-delimited Netscape cookie format")
+                return True
+        else:
+            # Try space-delimited (more flexible parsing)
+            parts = line.split()
+            if len(parts) >= 7:
+                # Validate that it looks like Netscape format
+                # Format: domain flag path secure expiration name value
+                domain = parts[0]
+                flag = parts[1]
+                path = parts[2]
+                secure = parts[3]
+                try:
+                    expiration = int(parts[4])
+                    name = parts[5]
+                    # Everything after name is the value
+                    if domain.startswith('.') and flag in ['TRUE', 'FALSE'] and path == '/' and secure in ['TRUE', 'FALSE']:
+                        logger.debug(f"Detected space-delimited Netscape cookie format")
+                        return True
+                except (ValueError, IndexError):
+                    continue
+    
     return False
 
 
@@ -120,23 +145,69 @@ def _extract_json_cookies(json_str: str) -> Dict[str, str]:
 
 
 def _extract_netscape_cookies(netscape_str: str) -> Dict[str, str]:
-    """Extract cookies from Netscape format."""
+    """Extract cookies from Netscape format (handles both tab and space delimited)."""
     kv: Dict[str, str] = {}
     lines = netscape_str.strip().split('\n')
     
     for line in lines:
+        original_line = line
         line = line.strip()
+        
         if not line or line.startswith('#'):
             continue
         
-        parts = line.split('\t')
+        # Determine delimiter (tab or space)
+        if '\t' in line:
+            # Tab-delimited format
+            parts = line.split('\t')
+            delimiter = '\t'
+        else:
+            # Space-delimited format (more complex)
+            parts = line.split()
+            delimiter = ' '
+        
         if len(parts) >= 7:
-            # Format: domain flag path secure expiration name value
-            name = parts[5]
-            value = parts[6]
-            if name and value:
-                kv[name] = value
+            try:
+                if delimiter == '\t':
+                    # Tab format: domain flag path secure expiration name value
+                    domain = parts[0]
+                    flag = parts[1]
+                    path = parts[2]
+                    secure = parts[3]
+                    expiration = parts[4]
+                    name = parts[5]
+                    value = parts[6]
+                else:
+                    # Space format: domain flag path secure expiration name value...
+                    domain = parts[0]
+                    flag = parts[1]
+                    path = parts[2]
+                    secure = parts[3]
+                    try:
+                        expiration = int(parts[4])
+                    except ValueError:
+                        continue
+                    name = parts[5]
+                    # Everything after position 6 is part of the value (for space-delimited)
+                    # Reconstruct the value from the original line
+                    # Format: domain flag path secure expiration name value
+                    match = re.match(
+                        r'^(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(\S+)\s+(.+)$',
+                        line
+                    )
+                    if match:
+                        value = match.group(7).strip()
+                    else:
+                        value = ' '.join(parts[6:])
+                
+                if name and value:
+                    kv[name] = value
+                    logger.debug(f"Extracted cookie: {name}")
+            except (ValueError, IndexError) as e:
+                logger.debug(f"Failed to parse Netscape cookie line: {line}, error: {e}")
+                continue
     
+    logger.info(f"Extracted {len(kv)} cookies from Netscape format")
     return kv
 
 
@@ -160,20 +231,27 @@ def _extract_cookie_kv_pairs(text: str) -> Dict[str, str]:
 def _build_cookie_header(cookie_input: str) -> Optional[str]:
     """Parse any cookie format and build a cookie header string."""
     
+    logger.info("Attempting to parse cookies...")
+    
     # Try JSON format first
     if _is_json_cookie(cookie_input):
+        logger.info("Detected JSON cookie format")
         kv = _extract_json_cookies(cookie_input)
         if kv:
             return "; ".join([f"{k}={v}" for k, v in kv.items()])
     
-    # Try Netscape format
+    # Try Netscape format (tab or space delimited)
     if _is_netscape_cookie(cookie_input):
+        logger.info("Detected Netscape cookie format")
         kv = _extract_netscape_cookies(cookie_input)
         if kv:
-            return "; ".join([f"{k}={v}" for k, v in kv.items()])
+            result = "; ".join([f"{k}={v}" for k, v in kv.items()])
+            logger.info(f"Successfully parsed {len(kv)} cookies from Netscape format")
+            return result
     
     # Try cookie header or key=value format
     if _looks_like_cookie_header(cookie_input):
+        logger.info("Detected Cookie header or key=value format")
         cleaned = re.sub(r"(?i)^\s*cookie\s*:\s*", "", cookie_input).strip()
         if "=" not in cleaned:
             return None
@@ -186,10 +264,12 @@ def _build_cookie_header(cookie_input: str) -> Optional[str]:
         return cleaned
 
     # Last resort: try to parse as key=value pairs
+    logger.info("Attempting to parse as key=value pairs")
     kv = _extract_cookie_kv_pairs(cookie_input)
     if kv:
         return "; ".join([f"{k}={v}" for k, v in kv.items()])
     
+    logger.warning("Could not parse cookies in any format")
     return None
 
 
@@ -492,10 +572,10 @@ async def handle_cookie_text(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 "❌ Could not parse cookies.\n\n"
                 "Paste in one of these formats:\n"
                 "• Full `Cookie:` header line\n"
-                "• Netscape format (.txt cookie file)\n"
+                "• Netscape format (.txt cookie file) - **both tab and space delimited**\n"
                 "• JSON array format\n"
-                "• Key=Value pairs (NetflixId=..., SecureNetflixId=..., ...)"
-                "\n\nThen send again."
+                "• Key=Value pairs (NetflixId=..., SecureNetflixId=..., ...)\n\n"
+                "Then send again."
             )
             return
 
@@ -681,4 +761,5 @@ if __name__ == "__main__":
         app_flask.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
     except KeyboardInterrupt:
         logger.info("🛑 Keyboard interrupt")
-        sys.exit(0)     
+        sys.exit(0)
+          
