@@ -381,7 +381,28 @@ def _scrub_text(text: str) -> str:
     if not text:
         return "Unknown"
     return str(text)
+    
+def decode_text(value):
+    if value is None:
+        return "Unknown"
 
+    value = str(value)
+
+    try:
+        # Decode \x20, \uXXXX, etc.
+        value = codecs.decode(value, "unicode_escape")
+    except Exception:
+        pass
+
+    # Decode HTML entities
+    value = html.unescape(value)
+
+    # Remove any remaining escape sequences
+    value = re.sub(r'\\x([0-9A-Fa-f]{2})',
+                   lambda m: bytes.fromhex(m.group(1)).decode('latin1'),
+                   value)
+
+    return value.strip()
 
 def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, str]:
     cookie_dict: Dict[str, str] = {}
@@ -436,7 +457,7 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
 
         def find(pattern: str) -> Optional[str]:
             m = re.search(pattern, txt)
-            return _scrub_text(m.group(1)) if m else None
+            return decode_text(m.group(1)) if m else None
 
         name = find(r'"accountOwnerName"\s*:\s*"([^"]+)"') or find(r'"firstName"\s*:\s*"([^"]+)"')
         plan_raw = find(r'localizedPlanName.{1,50}?value":"([^"]+)"') or find(r'"planName"\s*:\s*"([^"]+)"')
