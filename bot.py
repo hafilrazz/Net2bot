@@ -7,7 +7,7 @@ import time
 from threading import Thread
 import sys
 import json
-
+import codecs
 import requests
 import html
 from flask import Flask
@@ -78,7 +78,6 @@ def _is_json_cookie(text: str) -> bool:
         return True
     except:
         return False
-
 
 def _is_netscape_cookie(text: str) -> bool:
     """Check if text is Netscape format cookie (tab or space delimited)."""
@@ -507,7 +506,17 @@ def _check_netflix_cookie(cookie_header: str, timeout_s: int = 25) -> Dict[str, 
         except Exception:
             pass
 
-        profiles_str = ", ".join([_scrub_text(p) for p in profiles]) if profiles else None
+        def decode_profile_name(name):
+           try:
+              name = codecs.decode(name, "unicode_escape")
+           except Exception:
+              pass
+           return html.unescape(name)
+
+        profiles_str = (
+          ", ".join(decode_profile_name(_scrub_text(p)) for p in profiles)
+          if profiles else None
+       )
 
         return {
             "ok": True,
