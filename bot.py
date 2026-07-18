@@ -748,6 +748,7 @@ def index():
                 <div class="status {'running' if application else 'stopped'}">
                     <p><b>Bot Status:</b> {bot_status}</p>
                     <p><b>BOT_TOKEN:</b> {'✅ Set' if BOT_TOKEN else '❌ Not Set'}</p>
+                    <p><b>BOT_link:https://t.me/Cook2linkbot</b></p>
                     <p><b>Port:</b> {PORT}</p>
                 </div>
                 <hr>
